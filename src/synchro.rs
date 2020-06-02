@@ -7,10 +7,14 @@ use std::error;
 use std::fmt;
 
 //use rustfft::algorithm::Radix4;
-use rustfft::FFTplanner;
-use rustfft::num_complex::Complex;
-use rustfft::num_traits::Zero;
-use rustfft::FFT;
+//use rustfft::FFTplanner;
+//use rustfft::num_complex::Complex;
+//use rustfft::num_traits::Zero;
+//use rustfft::FFT;
+use num::complex::Complex;
+use fourier::create_fft_f64;
+use fourier::create_fft_f32;
+use fourier::Fft;
 
 type Res<T> = Result<T, Box<dyn error::Error>>;
 
@@ -23,18 +27,28 @@ pub struct RealToComplex<T> {
     sin: Vec<T>,
     cos: Vec<T>,
     length: usize,
+<<<<<<< HEAD
     fft: std::sync::Arc<dyn rustfft::FFT<T>>,
     buffer_in: Vec<Complex<T>>,
     buffer_out: Vec<Complex<T>>,
+=======
+    fft: Box<dyn Fft<Real = T>>,
+    buffer: Vec<Complex<T>>,
+>>>>>>> 8b10b00... try with fourier
 }
 
 pub struct ComplexToReal<T> {
     sin: Vec<T>,
     cos: Vec<T>,
     length: usize,
+<<<<<<< HEAD
     fft: std::sync::Arc<dyn rustfft::FFT<T>>,
     buffer_in: Vec<Complex<T>>,
     buffer_out: Vec<Complex<T>>,
+=======
+    fft: Box<dyn Fft<Real = T>>,
+    buffer: Vec<Complex<T>>,
+>>>>>>> 8b10b00... try with fourier
 }
 
 macro_rules! impl_r2c {

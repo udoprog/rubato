@@ -12,9 +12,11 @@ use std::fmt;
 //use rustfft::num_traits::Zero;
 //use rustfft::FFT;
 use num::complex::Complex;
+use num_traits::Zero;
 use fourier::create_fft_f64;
 use fourier::create_fft_f32;
 use fourier::Fft;
+use fourier::Transform;
 
 type Res<T> = Result<T, Box<dyn error::Error>>;
 
@@ -27,28 +29,18 @@ pub struct RealToComplex<T> {
     sin: Vec<T>,
     cos: Vec<T>,
     length: usize,
-<<<<<<< HEAD
-    fft: std::sync::Arc<dyn rustfft::FFT<T>>,
+    fft: Box<dyn Fft<Real = T>>,
     buffer_in: Vec<Complex<T>>,
     buffer_out: Vec<Complex<T>>,
-=======
-    fft: Box<dyn Fft<Real = T>>,
-    buffer: Vec<Complex<T>>,
->>>>>>> 8b10b00... try with fourier
 }
 
 pub struct ComplexToReal<T> {
     sin: Vec<T>,
     cos: Vec<T>,
     length: usize,
-<<<<<<< HEAD
-    fft: std::sync::Arc<dyn rustfft::FFT<T>>,
+    fft: Box<dyn Fft<Real = T>>,
     buffer_in: Vec<Complex<T>>,
     buffer_out: Vec<Complex<T>>,
-=======
-    fft: Box<dyn Fft<Real = T>>,
-    buffer: Vec<Complex<T>>,
->>>>>>> 8b10b00... try with fourier
 }
 
 macro_rules! impl_r2c {
@@ -66,8 +58,9 @@ macro_rules! impl_r2c {
                 }
                 //println!("sin {:?}", sin);
                 //println!("sin {:?}", cos);
-                let mut fft_planner = FFTplanner::<$ft>::new(false);
-                let fft = fft_planner.plan_fft(length/2);
+                //let mut fft_planner = FFTplanner::<$ft>::new(false);
+                //let fft = fft_planner.plan_fft(length/2);
+                let fft = create_fft_f64(length/2);
                 RealToComplex {
                     sin,
                     cos,
@@ -98,7 +91,8 @@ macro_rules! impl_r2c {
 //
                 //println!("fft");
                 // FFT and store result in buffer_out
-                self.fft.process(&mut self.buffer_in, &mut self.buffer_out[0..fftlen]);
+                //self.fft.process(&mut self.buffer_in, &mut self.buffer_out[0..fftlen]);
+                self.fft.transform(&self.buffer_in, &mut self.buffer_out[0..fftlen], Transform::Fft);
 
                 self.buffer_out[fftlen] = self.buffer_out[0];
                 //println!("buffer_out {:?}", self.buffer_out);
@@ -121,7 +115,7 @@ macro_rules! impl_r2c {
     }
 }
 impl_r2c!(f64);
-impl_r2c!(f32);
+//impl_r2c!(f32);
 
 macro_rules! impl_c2r {
     ($ft:ty) => {
@@ -136,8 +130,11 @@ macro_rules! impl_c2r {
                     sin.push((k as $ft * pi/(length/2) as $ft).sin());
                     cos.push((k as $ft * pi/(length/2) as $ft).cos());
                 }
-                let mut fft_planner = FFTplanner::<$ft>::new(true);
-                let fft = fft_planner.plan_fft(length/2);
+                let fft = create_fft_f64(length/2);
+                //fourier::Transform::Ifft
+                //fourier.transform(&input, &mut output, transform))
+                //let mut fft_planner = FFTplanner::<$ft>::new(true);
+                //let fft = fft_planner.plan_fft(length/2);
                 ComplexToReal {
                     sin,
                     cos,
@@ -168,7 +165,8 @@ macro_rules! impl_c2r {
                 }
 
                 // FFT and store result in buffer_out
-                self.fft.process(&mut self.buffer_in, &mut self.buffer_out);
+                //self.fft.process(&mut self.buffer_in, &mut self.buffer_out);
+                self.fft.transform(&self.buffer_in, &mut self.buffer_out, Transform::Ifft);
 
                 for (val, out) in self.buffer_out.iter().zip(output.chunks_mut(2)) {
                     out[0] = val.re;
@@ -180,7 +178,7 @@ macro_rules! impl_c2r {
     }
 }
 impl_c2r!(f64);
-impl_c2r!(f32);
+//impl_c2r!(f32);
 
 
 /// A resampler that accepts a fixed number of audio frames for input
@@ -283,7 +281,7 @@ macro_rules! impl_resampler {
 }
 //impl_resampler!(f32, FFTFixedIn<f32>);
 //impl_resampler!(f64, FFTFixedIn<f64>);
-impl_resampler!(f32, FFTFixedInOut<f32>);
+//impl_resampler!(f32, FFTFixedInOut<f32>);
 impl_resampler!(f64, FFTFixedInOut<f64>);
 
 macro_rules! impl_fixedinout {
@@ -428,7 +426,7 @@ macro_rules! resampler_sincfixedinout {
         }
     }
 }
-resampler_sincfixedinout!(f32);
+//resampler_sincfixedinout!(f32);
 resampler_sincfixedinout!(f64);
 
 //macro_rules! resampler_sincfixedin {

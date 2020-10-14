@@ -234,7 +234,7 @@ macro_rules! impl_resampler {
 
             /// Perform cubic polynomial interpolation to get value at x.
             /// Input points are assumed to be at x = -1, 0, 1, 2
-            fn interp_cubic(&self, x: $ft, yvals: &[$ft]) -> $ft {
+            fn interp_cubic(&self, x: $ft, yvals: &[$ft; 4]) -> $ft {
                 let a0 = yvals[1];
                 let a1 =
                     -(1.0 / 3.0) * yvals[0] - 0.5 * yvals[1] + yvals[2] - (1.0 / 6.0) * yvals[3];
@@ -244,7 +244,7 @@ macro_rules! impl_resampler {
             }
 
             /// Linear interpolation between two points at x=0 and x=1
-            fn interp_lin(&self, x: $ft, yvals: &[$ft]) -> $ft {
+            fn interp_lin(&self, x: $ft, yvals: &[$ft; 2]) -> $ft {
                 (1.0 - x) * yvals[0] + x * yvals[1]
             }
         }
@@ -324,11 +324,14 @@ macro_rules! resampler_sincfixedin {
                 let end_idx = self.chunk_size as isize - (self.sinc_len as isize + 1);
                 //update buffer with new data
                 for wav in self.buffer.iter_mut() {
+                    assert!(wav.len() >= (self.chunk_size + 2 * self.sinc_len));
                     for idx in 0..(2 * self.sinc_len) {
                         wav[idx] = wav[idx + self.chunk_size];
                     }
                 }
                 for (chan, wav) in wave_in.iter().enumerate() {
+                    assert!(wav.len() >= self.chunk_size);
+                    assert!(self.buffer[chan].len() >= (self.chunk_size + 2 * self.sinc_len));
                     for (idx, sample) in wav.iter().enumerate() {
                         self.buffer[chan][idx + 2 * self.sinc_len] = *sample;
                     }
@@ -349,8 +352,8 @@ macro_rules! resampler_sincfixedin {
 
                 match self.interpolation {
                     InterpolationType::Cubic => {
-                        let mut points = vec![0.0 as $t; 4];
-                        let mut nearest = vec![(0isize, 0isize); 4];
+                        let mut points = [0.0 as $t; 4];
+                        let mut nearest = [(0isize, 0isize); 4];
                         while idx < end_idx as f64 {
                             idx += t_ratio;
                             get_nearest_times_4(
@@ -375,8 +378,8 @@ macro_rules! resampler_sincfixedin {
                         }
                     }
                     InterpolationType::Linear => {
-                        let mut points = vec![0.0 as $t; 2];
-                        let mut nearest = vec![(0isize, 0isize); 2];
+                        let mut points = [0.0 as $t; 2];
+                        let mut nearest = [(0isize, 0isize); 2];
                         while idx < end_idx as f64 {
                             idx += t_ratio;
                             get_nearest_times_2(
@@ -586,8 +589,8 @@ macro_rules! resampler_sincfixedout {
 
                 match self.interpolation {
                     InterpolationType::Cubic => {
-                        let mut points = vec![0.0 as $t; 4];
-                        let mut nearest = vec![(0isize, 0isize); 4];
+                        let mut points = [0.0 as $t; 4];
+                        let mut nearest = [(0isize, 0isize); 4];
                         for n in 0..self.chunk_size {
                             idx += t_ratio;
                             get_nearest_times_4(idx, self.oversampling_factor as isize, &mut nearest);
@@ -607,8 +610,8 @@ macro_rules! resampler_sincfixedout {
                         }
                     }
                     InterpolationType::Linear => {
-                        let mut points = vec![0.0 as $t; 2];
-                        let mut nearest = vec![(0isize, 0isize); 2];
+                        let mut points = [0.0 as $t; 2];
+                        let mut nearest = [(0isize, 0isize); 2];
                         for n in 0..self.chunk_size {
                             idx += t_ratio;
                             get_nearest_times_2(idx, self.oversampling_factor as isize, &mut nearest);
@@ -685,7 +688,7 @@ mod tests {
             window: WindowFunction::BlackmanHarris2,
         };
         let resampler = SincFixedIn::<f64>::new(1.2, params, 1024, 2);
-        let yvals = vec![0.0f64, 2.0f64, 4.0f64, 6.0f64];
+        let yvals = [0.0f64, 2.0f64, 4.0f64, 6.0f64];
         let interp = resampler.interp_cubic(0.5f64, &yvals);
         assert_eq!(interp, 3.0f64);
     }
@@ -700,7 +703,7 @@ mod tests {
             window: WindowFunction::BlackmanHarris2,
         };
         let resampler = SincFixedIn::<f32>::new(1.2, params, 1024, 2);
-        let yvals = vec![1.0f32, 5.0f32];
+        let yvals = [1.0f32, 5.0f32];
         let interp = resampler.interp_lin(0.25f32, &yvals);
         assert_eq!(interp, 2.0f32);
     }
@@ -715,7 +718,7 @@ mod tests {
             window: WindowFunction::BlackmanHarris2,
         };
         let resampler = SincFixedIn::<f32>::new(1.2, params, 1024, 2);
-        let yvals = vec![0.0f32, 2.0f32, 4.0f32, 6.0f32];
+        let yvals = [0.0f32, 2.0f32, 4.0f32, 6.0f32];
         let interp = resampler.interp_cubic(0.5f32, &yvals);
         assert_eq!(interp, 3.0f32);
     }
@@ -730,7 +733,7 @@ mod tests {
             window: WindowFunction::BlackmanHarris2,
         };
         let resampler = SincFixedIn::<f64>::new(1.2, params, 1024, 2);
-        let yvals = vec![1.0f64, 5.0f64];
+        let yvals = [1.0f64, 5.0f64];
         let interp = resampler.interp_lin(0.25f64, &yvals);
         assert_eq!(interp, 2.0f64);
     }

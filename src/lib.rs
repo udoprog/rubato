@@ -324,14 +324,11 @@ macro_rules! resampler_sincfixedin {
                 let end_idx = self.chunk_size as isize - (self.sinc_len as isize + 1);
                 //update buffer with new data
                 for wav in self.buffer.iter_mut() {
-                    assert!(wav.len() >= (self.chunk_size + 2 * self.sinc_len));
                     for idx in 0..(2 * self.sinc_len) {
                         wav[idx] = wav[idx + self.chunk_size];
                     }
                 }
                 for (chan, wav) in wave_in.iter().enumerate() {
-                    assert!(wav.len() >= self.chunk_size);
-                    assert!(self.buffer[chan].len() >= (self.chunk_size + 2 * self.sinc_len));
                     for (idx, sample) in wav.iter().enumerate() {
                         self.buffer[chan][idx + 2 * self.sinc_len] = *sample;
                     }

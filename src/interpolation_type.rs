@@ -112,7 +112,7 @@ impl InterpolationType {
 }
 
 /// Indexes from a given start, to
-pub(crate) struct RatioIndexer {
+pub struct RatioIndexer {
     pub(crate) current: f64,
     t_ratio: f64,
     pub(crate) index: usize,
@@ -146,7 +146,7 @@ impl Iterator for RatioIndexer {
 }
 
 /// Indexes from a given start, to
-pub(crate) struct SpanIndexer {
+pub struct SpanIndexer {
     pub(crate) current: f64,
     t_ratio: f64,
     pub(crate) index: usize,

@@ -103,38 +103,214 @@ where
     }
 }
 
+/// A current set of sinc parameters. These might or might not be dynamic.
+#[derive(Debug, Clone, Copy)]
+pub struct SincParams {
+    needed_input: usize,
+    current_fill: usize,
+    output_len: usize,
+}
+
+/// A currently internal only trait which governs how a sinc implementation
+/// works.
+pub trait SincKind {
+    type Indexer: Iterator<Item = (usize, f64)>;
+
+    /// Construct a new sinc kind with the specified parameters.
+    fn new(chunk_size: usize, resample_ratio: f64, len: usize) -> Self;
+
+    /// Get the current chunk size.
+    fn chunk_size(&self) -> usize;
+
+    /// Get the current sampling parameters.
+    fn params(&self) -> SincParams;
+
+    /// Construct a new indexer used to calculate frame indexes being resampled.
+    fn indexer(&mut self, sinc_len: usize) -> Self::Indexer;
+
+    /// Get the current number of frames needed.
+    fn frames_needed(&self) -> usize;
+
+    /// Perform an internal post-processing stage.
+    fn post_process<T>(
+        &mut self,
+        indexer: Self::Indexer,
+        sinc_len: usize,
+        channels: &[usize],
+        wave_out: &mut [Vec<T>],
+    );
+
+    /// Update the internal resample ratio.
+    fn update_resample_ratio(&mut self, new_ratio: f64, sinc_len: usize);
+}
+
+#[derive(Default)]
+pub struct FixedOut {
+    resample_ratio: f64,
+    last_index: f64,
+    chunk_size: usize,
+    needed_input_size: usize,
+    current_buffer_fill: usize,
+}
+
+impl SincKind for FixedOut {
+    type Indexer = crate::interpolation_type::RatioIndexer;
+
+    fn new(chunk_size: usize, resample_ratio: f64, sinc_len: usize) -> Self {
+        let needed_input_size =
+            (chunk_size as f64 / resample_ratio).ceil() as usize + 2 + sinc_len / 2;
+
+        Self {
+            resample_ratio,
+            last_index: -((sinc_len / 2) as f64),
+            chunk_size,
+            needed_input_size,
+            current_buffer_fill: needed_input_size,
+        }
+    }
+
+    fn chunk_size(&self) -> usize {
+        3 * self.needed_input_size / 2
+    }
+
+    fn params(&self) -> SincParams {
+        SincParams {
+            needed_input: self.needed_input_size,
+            current_fill: self.current_buffer_fill,
+            output_len: self.chunk_size,
+        }
+    }
+
+    fn frames_needed(&self) -> usize {
+        self.needed_input_size
+    }
+
+    fn indexer(&mut self, _: usize) -> Self::Indexer {
+        let t_ratio = 1.0 / self.resample_ratio as f64;
+
+        crate::interpolation_type::RatioIndexer::new(self.last_index, t_ratio, self.chunk_size)
+    }
+
+    fn post_process<T>(
+        &mut self,
+        indexer: Self::Indexer,
+        sinc_len: usize,
+        _: &[usize],
+        _: &mut [Vec<T>],
+    ) {
+        let idx = indexer.current;
+
+        self.current_buffer_fill = self.needed_input_size;
+        // store last index for next iteration
+        self.last_index = idx - self.current_buffer_fill as f64;
+
+        self.needed_input_size = (self.last_index as f32
+            + self.chunk_size as f32 / self.resample_ratio as f32
+            + sinc_len as f32)
+            .ceil() as usize
+            + 2;
+    }
+
+    fn update_resample_ratio(&mut self, new_ratio: f64, sinc_len: usize) {
+        self.resample_ratio = new_ratio;
+
+        self.needed_input_size = (self.last_index as f32
+            + self.chunk_size as f32 / self.resample_ratio as f32
+            + sinc_len as f32)
+            .ceil() as usize
+            + 2;
+    }
+}
+
+#[derive(Default)]
+pub struct FixedIn {
+    resample_ratio: f64,
+    last_index: f64,
+    chunk_size: usize,
+}
+
+impl SincKind for FixedIn {
+    type Indexer = crate::interpolation_type::SpanIndexer;
+
+    fn new(chunk_size: usize, resample_ratio: f64, sinc_len: usize) -> Self {
+        Self {
+            resample_ratio,
+            last_index: -((sinc_len / 2) as f64),
+            chunk_size,
+        }
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    fn params(&self) -> SincParams {
+        let output_len = (self.chunk_size as f64 * self.resample_ratio + 10.0) as usize;
+
+        SincParams {
+            needed_input: self.chunk_size,
+            current_fill: self.chunk_size,
+            output_len,
+        }
+    }
+
+    fn frames_needed(&self) -> usize {
+        self.chunk_size
+    }
+
+    fn indexer(&mut self, sinc_len: usize) -> Self::Indexer {
+        let t_ratio = 1.0 / self.resample_ratio as f64;
+        let end_idx = self.chunk_size as isize - (sinc_len as isize + 1);
+
+        crate::interpolation_type::SpanIndexer::new(self.last_index, t_ratio, end_idx as f64)
+    }
+
+    fn post_process<T>(
+        &mut self,
+        indexer: Self::Indexer,
+        _: usize,
+        channels: &[usize],
+        wave_out: &mut [Vec<T>],
+    ) {
+        let idx = indexer.current;
+        let n = indexer.index;
+
+        // store last index for next iteration
+        self.last_index = idx - self.chunk_size as f64;
+
+        for chan in channels {
+            //for w in wave_out.iter_mut() {
+            wave_out[*chan].truncate(n);
+        }
+    }
+
+    #[inline]
+    fn update_resample_ratio(&mut self, new_ratio: f64, _: usize) {
+        self.resample_ratio = new_ratio;
+    }
+}
+
 /// An asynchronous resampler that accepts a fixed number of audio frames for input
 /// and returns a variable number of frames.
 ///
 /// The resampling is done by creating a number of intermediate points (defined by oversampling_factor)
 /// by sinc interpolation. The new samples are then calculated by interpolating between these points.
-pub struct SincFixedIn<T> {
-    nbr_channels: usize,
-    chunk_size: usize,
-    last_index: f64,
-    resample_ratio: f64,
-    resample_ratio_original: f64,
-    interpolator: Box<dyn SincInterpolator<T>>,
-    buffer: Vec<Vec<T>>,
-    interpolation: InterpolationType,
-}
+pub type SincFixedIn<T> = Sinc<T, FixedIn>;
 
-/// An asynchronous resampler that return a fixed number of audio frames.
-/// The number of input frames required is given by the frames_needed function.
+/// An asynchronous resampler that accepts a fixed number of audio frames for input
+/// and returns a variable number of frames.
 ///
 /// The resampling is done by creating a number of intermediate points (defined by oversampling_factor)
 /// by sinc interpolation. The new samples are then calculated by interpolating between these points.
-pub struct SincFixedOut<T> {
+pub type SincFixedOut<T> = Sinc<T, FixedOut>;
+
+pub struct Sinc<T, K> {
     nbr_channels: usize,
-    chunk_size: usize,
-    needed_input_size: usize,
-    last_index: f64,
-    current_buffer_fill: usize,
-    resample_ratio: f64,
     resample_ratio_original: f64,
     interpolator: Box<dyn SincInterpolator<T>>,
     buffer: Vec<Vec<T>>,
     interpolation: InterpolationType,
+    kind: K,
 }
 
 pub fn make_interpolator<T>(
@@ -208,78 +384,10 @@ where
     (T::one() - x) * yvals[0] + x * yvals[1]
 }
 
-impl<T> SincFixedIn<T>
+impl<T, K> Resampler<T> for Sinc<T, K>
 where
     T: Sample,
-{
-    /// Create a new SincFixedIn
-    ///
-    /// Parameters are:
-    /// - `resample_ratio`: Ratio between output and input sample rates.
-    /// - `parameters`: Parameters for interpolation, see `InterpolationParameters`
-    /// - `chunk_size`: size of input data in frames
-    /// - `nbr_channels`: number of channels in input/output
-    pub fn new(
-        resample_ratio: f64,
-        parameters: InterpolationParameters,
-        chunk_size: usize,
-        nbr_channels: usize,
-    ) -> Self {
-        debug!(
-            "Create new SincFixedIn, ratio: {}, chunk_size: {}, channels: {}, parameters: {:?}",
-            resample_ratio, chunk_size, nbr_channels, parameters
-        );
-
-        let interpolator = make_interpolator(
-            parameters.sinc_len,
-            resample_ratio,
-            parameters.f_cutoff,
-            parameters.oversampling_factor,
-            parameters.window,
-        );
-
-        Self::new_with_interpolator(
-            resample_ratio,
-            parameters.interpolation,
-            interpolator,
-            chunk_size,
-            nbr_channels,
-        )
-    }
-
-    /// Create a new SincFixedIn using an existing Interpolator
-    ///
-    /// Parameters are:
-    /// - `resample_ratio`: Ratio between output and input sample rates.
-    /// - `interpolation_type`: Parameters for interpolation, see `InterpolationParameters`
-    /// - `interpolator`:  The interpolator to use
-    /// - `chunk_size`: size of output data in frames
-    /// - `nbr_channels`: number of channels in input/output
-    pub fn new_with_interpolator(
-        resample_ratio: f64,
-        interpolation_type: InterpolationType,
-        interpolator: Box<dyn SincInterpolator<T>>,
-        chunk_size: usize,
-        nbr_channels: usize,
-    ) -> Self {
-        let buffer = vec![vec![T::zero(); chunk_size + 2 * interpolator.len()]; nbr_channels];
-
-        SincFixedIn {
-            nbr_channels,
-            chunk_size,
-            last_index: -((interpolator.len() / 2) as f64),
-            resample_ratio,
-            resample_ratio_original: resample_ratio,
-            interpolator,
-            buffer,
-            interpolation: interpolation_type,
-        }
-    }
-}
-
-impl<T> Resampler<T> for SincFixedIn<T>
-where
-    T: Sample,
+    K: SincKind,
 {
     /// Resample a chunk of audio. The input length is fixed, and the output varies in length.
     /// If the waveform for a channel is empty, this channel will be ignored and produce a
@@ -295,26 +403,31 @@ where
                 actual: wave_in.len(),
             });
         }
+
+        let p = self.kind.params();
+
         let mut used_channels = Vec::new();
+
         for (chan, wave) in wave_in.iter().enumerate() {
             if !wave.is_empty() {
                 used_channels.push(chan);
-                if wave.len() != self.chunk_size {
+                if wave.len() != p.needed_input {
                     return Err(ResampleError::WrongNumberOfFrames {
                         channel: chan,
-                        expected: self.chunk_size,
+                        expected: p.needed_input,
                         actual: wave.len(),
                     });
                 }
             }
         }
+
         let sinc_len = self.interpolator.len();
         let oversampling_factor = self.interpolator.nbr_sincs();
-        let end_idx = self.chunk_size as isize - (sinc_len as isize + 1);
+
         //update buffer with new data
         for wav in self.buffer.iter_mut() {
             for idx in 0..(2 * sinc_len) {
-                wav[idx] = wav[idx + self.chunk_size];
+                wav[idx] = wav[idx + p.current_fill];
             }
         }
 
@@ -324,14 +437,11 @@ where
             for (idx, sample) in wave_in[*chan].iter().enumerate() {
                 self.buffer[*chan][idx + 2 * sinc_len] = *sample;
             }
-            wave_out[*chan] =
-                vec![T::zero(); (self.chunk_size as f64 * self.resample_ratio + 10.0) as usize];
+
+            wave_out[*chan] = vec![T::zero(); p.output_len];
         }
 
-        let t_ratio = 1.0 / self.resample_ratio as f64;
-
-        let mut indexer =
-            crate::interpolation_type::SpanIndexer::new(self.last_index, t_ratio, end_idx as f64);
+        let mut indexer = self.kind.indexer(sinc_len);
 
         self.interpolation.apply_to(
             &used_channels,
@@ -343,28 +453,22 @@ where
             &mut wave_out,
         );
 
-        let idx = indexer.current;
-        let n = indexer.index;
+        self.kind
+            .post_process(indexer, sinc_len, &used_channels, &mut wave_out);
 
-        // store last index for next iteration
-        self.last_index = idx - self.chunk_size as f64;
-        for chan in used_channels.iter() {
-            //for w in wave_out.iter_mut() {
-            wave_out[*chan].truncate(n);
-        }
-        trace!(
+        /*trace!(
             "Resampling channels {:?}, {} frames in, {} frames out",
             used_channels,
             self.chunk_size,
             n,
-        );
+        );*/
         Ok(wave_out)
     }
 
     /// Query for the number of frames needed for the next call to "process".
     /// Will always return the chunk_size defined when creating the instance.
     fn nbr_frames_needed(&self) -> usize {
-        self.chunk_size
+        self.kind.frames_needed()
     }
 
     /// Update the resample ratio. New value must be within +-10% of the original one
@@ -373,7 +477,8 @@ where
         if (new_ratio / self.resample_ratio_original > 0.9)
             && (new_ratio / self.resample_ratio_original < 1.1)
         {
-            self.resample_ratio = new_ratio;
+            self.kind
+                .update_resample_ratio(new_ratio, self.interpolator.len());
             Ok(())
         } else {
             Err(ResampleError::BadRatioUpdate)
@@ -386,9 +491,10 @@ where
     }
 }
 
-impl<T> SincFixedOut<T>
+impl<T, K> Sinc<T, K>
 where
     T: Sample,
+    K: SincKind,
 {
     /// Create a new SincFixedOut
     ///
@@ -404,9 +510,10 @@ where
         nbr_channels: usize,
     ) -> Self {
         debug!(
-            "Create new SincFixedIn, ratio: {}, chunk_size: {}, channels: {}, parameters: {:?}",
+            "Create new Sinc, ratio: {}, chunk_size: {}, channels: {}, parameters: {:?}",
             resample_ratio, chunk_size, nbr_channels, parameters
         );
+
         let interpolator = make_interpolator(
             parameters.sinc_len,
             resample_ratio,
@@ -439,141 +546,19 @@ where
         chunk_size: usize,
         nbr_channels: usize,
     ) -> Self {
-        let needed_input_size =
-            (chunk_size as f64 / resample_ratio).ceil() as usize + 2 + interpolator.len() / 2;
-        let buffer =
-            vec![vec![T::zero(); 3 * needed_input_size / 2 + 2 * interpolator.len()]; nbr_channels];
+        let kind = K::new(chunk_size, resample_ratio, interpolator.len());
 
-        SincFixedOut {
+        let buffer =
+            vec![vec![T::zero(); kind.chunk_size() + 2 * interpolator.len()]; nbr_channels];
+
+        Self {
             nbr_channels,
-            chunk_size,
-            needed_input_size,
-            last_index: -((interpolator.len() / 2) as f64),
-            current_buffer_fill: needed_input_size,
-            resample_ratio,
             resample_ratio_original: resample_ratio,
             interpolator,
             buffer,
             interpolation: interpolation_type,
+            kind,
         }
-    }
-}
-
-impl<T> Resampler<T> for SincFixedOut<T>
-where
-    T: Sample,
-{
-    /// Query for the number of frames needed for the next call to "process".
-    fn nbr_frames_needed(&self) -> usize {
-        self.needed_input_size
-    }
-
-    /// Resample a chunk of audio. The required input length is provided by
-    /// the "nbr_frames_needed" function, and the output length is fixed.
-    /// If the waveform for a channel is empty, this channel will be ignored and produce a
-    /// corresponding empty output waveform.
-    /// # Errors
-    ///
-    /// The function returns an error if the length of the input data is not
-    /// equal to the number of channels defined when creating the instance,
-    /// and the number of audio frames given by "nbr_frames_needed".
-    fn process(&mut self, wave_in: &[Vec<T>]) -> ResampleResult<Vec<Vec<T>>> {
-        //update buffer with new data
-        if wave_in.len() != self.nbr_channels {
-            return Err(ResampleError::WrongNumberOfChannels {
-                expected: self.nbr_channels,
-                actual: wave_in.len(),
-            });
-        }
-        let sinc_len = self.interpolator.len();
-        let oversampling_factor = self.interpolator.nbr_sincs();
-        let mut used_channels = Vec::new();
-        for (chan, wave) in wave_in.iter().enumerate() {
-            if !wave.is_empty() {
-                used_channels.push(chan);
-                if wave.len() != self.needed_input_size {
-                    return Err(ResampleError::WrongNumberOfFrames {
-                        channel: chan,
-                        expected: self.needed_input_size,
-                        actual: wave.len(),
-                    });
-                }
-            }
-        }
-        for wav in self.buffer.iter_mut() {
-            for idx in 0..(2 * sinc_len) {
-                wav[idx] = wav[idx + self.current_buffer_fill];
-            }
-        }
-        self.current_buffer_fill = self.needed_input_size;
-
-        let mut wave_out = vec![Vec::new(); self.nbr_channels];
-
-        for chan in used_channels.iter() {
-            for (idx, sample) in wave_in[*chan].iter().enumerate() {
-                self.buffer[*chan][idx + 2 * sinc_len] = *sample;
-            }
-            wave_out[*chan] = vec![T::zero(); self.chunk_size];
-        }
-
-        let t_ratio = 1.0 / self.resample_ratio as f64;
-
-        let mut indexer =
-            crate::interpolation_type::RatioIndexer::new(self.last_index, t_ratio, self.chunk_size);
-
-        self.interpolation.apply_to(
-            &used_channels,
-            &self.buffer,
-            &mut indexer,
-            oversampling_factor,
-            sinc_len,
-            self.interpolator.as_ref(),
-            &mut wave_out,
-        );
-
-        let idx = indexer.current;
-
-        let prev_input_len = self.needed_input_size;
-        // store last index for next iteration
-        self.last_index = idx - self.current_buffer_fill as f64;
-        self.needed_input_size = (self.last_index as f32
-            + self.chunk_size as f32 / self.resample_ratio as f32
-            + sinc_len as f32)
-            .ceil() as usize
-            + 2;
-        trace!(
-            "Resampling channels {:?}, {} frames in, {} frames out. Next needed length: {} frames, last index {}",
-            used_channels,
-            prev_input_len,
-            self.chunk_size,
-            self.needed_input_size,
-            self.last_index
-        );
-        Ok(wave_out)
-    }
-
-    /// Update the resample ratio. New value must be within +-10% of the original one
-    fn set_resample_ratio(&mut self, new_ratio: f64) -> ResampleResult<()> {
-        trace!("Change resample ratio to {}", new_ratio);
-        if (new_ratio / self.resample_ratio_original > 0.9)
-            && (new_ratio / self.resample_ratio_original < 1.1)
-        {
-            self.resample_ratio = new_ratio;
-            self.needed_input_size = (self.last_index as f32
-                + self.chunk_size as f32 / self.resample_ratio as f32
-                + self.interpolator.len() as f32)
-                .ceil() as usize
-                + 2;
-            Ok(())
-        } else {
-            Err(ResampleError::BadRatioUpdate)
-        }
-    }
-
-    /// Update the resample ratio relative to the original one
-    fn set_resample_ratio_relative(&mut self, rel_ratio: f64) -> ResampleResult<()> {
-        let new_ratio = self.resample_ratio_original * rel_ratio;
-        self.set_resample_ratio(new_ratio)
     }
 }
 

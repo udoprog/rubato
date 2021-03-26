@@ -1,5 +1,4 @@
 use crate::error::{ResampleError, ResampleResult};
-use crate::interpolation::*;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 use crate::interpolator_avx::AvxInterpolator;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
@@ -186,7 +185,7 @@ where
 
 /// Perform cubic polynomial interpolation to get value at x.
 /// Input points are assumed to be at x = -1, 0, 1, 2
-fn interp_cubic<T>(x: T, yvals: &[T; 4]) -> T
+pub(crate) fn interp_cubic<T>(x: T, yvals: &[T; 4]) -> T
 where
     T: Sample,
 {
@@ -202,7 +201,7 @@ where
 }
 
 /// Linear interpolation between two points at x=0 and x=1
-fn interp_lin<T>(x: T, yvals: &[T; 2]) -> T
+pub(crate) fn interp_lin<T>(x: T, yvals: &[T; 2]) -> T
 where
     T: Sample,
 {
@@ -329,77 +328,23 @@ where
                 vec![T::zero(); (self.chunk_size as f64 * self.resample_ratio + 10.0) as usize];
         }
 
-        let mut idx = self.last_index;
         let t_ratio = 1.0 / self.resample_ratio as f64;
 
-        let mut n = 0;
+        let mut indexer =
+            crate::interpolation_type::SpanIndexer::new(self.last_index, t_ratio, end_idx as f64);
 
-        match self.interpolation {
-            InterpolationType::Cubic => {
-                let mut points = [T::zero(); 4];
-                let mut nearest = [(0isize, 0isize); 4];
-                while idx < end_idx as f64 {
-                    idx += t_ratio;
-                    get_nearest_times_4(idx, oversampling_factor as isize, &mut nearest);
-                    let frac = idx * oversampling_factor as f64
-                        - (idx * oversampling_factor as f64).floor();
-                    let frac_offset = T::coerce(frac);
-                    for chan in used_channels.iter() {
-                        let buf = &self.buffer[*chan];
-                        for (n, p) in nearest.iter().zip(points.iter_mut()) {
-                            *p = self.interpolator.get_sinc_interpolated(
-                                &buf,
-                                (n.0 + 2 * sinc_len as isize) as usize,
-                                n.1 as usize,
-                            );
-                        }
-                        wave_out[*chan][n] = interp_cubic(frac_offset, &points);
-                    }
-                    n += 1;
-                }
-            }
-            InterpolationType::Linear => {
-                let mut points = [T::zero(); 2];
-                let mut nearest = [(0isize, 0isize); 2];
-                while idx < end_idx as f64 {
-                    idx += t_ratio;
-                    get_nearest_times_2(idx, oversampling_factor as isize, &mut nearest);
-                    let frac = idx * oversampling_factor as f64
-                        - (idx * oversampling_factor as f64).floor();
-                    let frac_offset = T::coerce(frac);
-                    for chan in used_channels.iter() {
-                        let buf = &self.buffer[*chan];
-                        for (n, p) in nearest.iter().zip(points.iter_mut()) {
-                            *p = self.interpolator.get_sinc_interpolated(
-                                &buf,
-                                (n.0 + 2 * sinc_len as isize) as usize,
-                                n.1 as usize,
-                            );
-                        }
-                        wave_out[*chan][n] = interp_lin(frac_offset, &points);
-                    }
-                    n += 1;
-                }
-            }
-            InterpolationType::Nearest => {
-                let mut point;
-                let mut nearest;
-                while idx < end_idx as f64 {
-                    idx += t_ratio;
-                    nearest = get_nearest_time(idx, oversampling_factor as isize);
-                    for chan in used_channels.iter() {
-                        let buf = &self.buffer[*chan];
-                        point = self.interpolator.get_sinc_interpolated(
-                            &buf,
-                            (nearest.0 + 2 * sinc_len as isize) as usize,
-                            nearest.1 as usize,
-                        );
-                        wave_out[*chan][n] = point;
-                    }
-                    n += 1;
-                }
-            }
-        }
+        self.interpolation.apply_to(
+            &used_channels,
+            &self.buffer,
+            &mut indexer,
+            oversampling_factor,
+            sinc_len,
+            self.interpolator.as_ref(),
+            &mut wave_out,
+        );
+
+        let idx = indexer.current;
+        let n = indexer.index;
 
         // store last index for next iteration
         self.last_index = idx - self.chunk_size as f64;
@@ -571,72 +516,22 @@ where
             wave_out[*chan] = vec![T::zero(); self.chunk_size];
         }
 
-        let mut idx = self.last_index;
         let t_ratio = 1.0 / self.resample_ratio as f64;
 
-        match self.interpolation {
-            InterpolationType::Cubic => {
-                let mut points = [T::zero(); 4];
-                let mut nearest = [(0isize, 0isize); 4];
-                for n in 0..self.chunk_size {
-                    idx += t_ratio;
-                    get_nearest_times_4(idx, oversampling_factor as isize, &mut nearest);
-                    let frac = idx * oversampling_factor as f64
-                        - (idx * oversampling_factor as f64).floor();
-                    let frac_offset = T::coerce(frac);
-                    for chan in used_channels.iter() {
-                        let buf = &self.buffer[*chan];
-                        for (n, p) in nearest.iter().zip(points.iter_mut()) {
-                            *p = self.interpolator.get_sinc_interpolated(
-                                &buf,
-                                (n.0 + 2 * sinc_len as isize) as usize,
-                                n.1 as usize,
-                            );
-                        }
-                        wave_out[*chan][n] = interp_cubic(frac_offset, &points);
-                    }
-                }
-            }
-            InterpolationType::Linear => {
-                let mut points = [T::zero(); 2];
-                let mut nearest = [(0isize, 0isize); 2];
-                for n in 0..self.chunk_size {
-                    idx += t_ratio;
-                    get_nearest_times_2(idx, oversampling_factor as isize, &mut nearest);
-                    let frac = idx * oversampling_factor as f64
-                        - (idx * oversampling_factor as f64).floor();
-                    let frac_offset = T::coerce(frac);
-                    for chan in used_channels.iter() {
-                        let buf = &self.buffer[*chan];
-                        for (n, p) in nearest.iter().zip(points.iter_mut()) {
-                            *p = self.interpolator.get_sinc_interpolated(
-                                &buf,
-                                (n.0 + 2 * sinc_len as isize) as usize,
-                                n.1 as usize,
-                            );
-                        }
-                        wave_out[*chan][n] = interp_lin(frac_offset, &points);
-                    }
-                }
-            }
-            InterpolationType::Nearest => {
-                let mut point;
-                let mut nearest;
-                for n in 0..self.chunk_size {
-                    idx += t_ratio;
-                    nearest = get_nearest_time(idx, oversampling_factor as isize);
-                    for chan in used_channels.iter() {
-                        let buf = &self.buffer[*chan];
-                        point = self.interpolator.get_sinc_interpolated(
-                            &buf,
-                            (nearest.0 + 2 * sinc_len as isize) as usize,
-                            nearest.1 as usize,
-                        );
-                        wave_out[*chan][n] = point;
-                    }
-                }
-            }
-        }
+        let mut indexer =
+            crate::interpolation_type::RatioIndexer::new(self.last_index, t_ratio, self.chunk_size);
+
+        self.interpolation.apply_to(
+            &used_channels,
+            &self.buffer,
+            &mut indexer,
+            oversampling_factor,
+            sinc_len,
+            self.interpolator.as_ref(),
+            &mut wave_out,
+        );
+
+        let idx = indexer.current;
 
         let prev_input_len = self.needed_input_size;
         // store last index for next iteration

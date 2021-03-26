@@ -77,11 +77,13 @@
 mod asynchro;
 mod error;
 mod interpolation;
+mod interpolation_type;
 mod sample;
 mod sinc;
 mod synchro;
 mod windows;
 
+pub use self::interpolation_type::InterpolationType;
 pub use crate::asynchro::{ScalarInterpolator, SincFixedIn, SincFixedOut};
 pub use crate::error::{CpuFeature, MissingCpuFeature, ResampleError, ResampleResult};
 pub use crate::sample::Sample;
@@ -156,39 +158,6 @@ pub struct InterpolationParameters {
     pub interpolation: InterpolationType,
     /// Window function to use.
     pub window: WindowFunction,
-}
-
-/// Interpolation methods that can be selected. For asynchronous interpolation where the
-/// ratio between inut and output sample rates can be any number, it's not possible to
-/// pre-calculate all the needed interpolation filters.
-/// Instead they have to be computed as needed, which becomes impractical since the
-/// sincs are very expensive to generate in terms of cpu time.
-/// It's more efficient to combine the sinc filters with some other interpolation technique.
-/// Then sinc filters are used to provide a fixed number of interpolated points between input samples,
-/// and then the new value is calculated by interpolation between those points.
-#[derive(Debug)]
-pub enum InterpolationType {
-    /// For cubic interpolation, the four nearest intermediate points are calculated
-    /// using sinc interpolation.
-    /// Then a cubic polynomial is fitted to these points, and is then used to calculate the new sample value.
-    /// The computation time as about twice the one for linear interpolation,
-    /// but it requires much fewer intermediate points for a good result.
-    Cubic,
-    /// With linear interpolation the new sample value is calculated by linear interpolation
-    /// between the two nearest points.
-    /// This requires two intermediate points to be calcuated using sinc interpolation,
-    /// and te output is a weighted average of these two.
-    /// This is relatively fast, but needs a large number of intermediate points to
-    /// push the resampling artefacts below the noise floor.
-    Linear,
-    /// The Nearest mode doesn't do any interpolation, but simply picks the nearest intermediate point.
-    /// This is useful when the nearest point is actually the correct one, for example when upsampling by a factor 2,
-    /// like 48kHz->96kHz.
-    /// Then setting the oversampling_factor to 2, and using Nearest mode,
-    /// no unneccesary computations are performed and the result is the same as for synchronous resampling.
-    /// This also works for other ratios that can be expressed by a fraction. For 44.1kHz -> 48 kHz,
-    /// setting oversampling_factor to 160 gives the desired result (since 48kHz = 160/147 * 44.1kHz).
-    Nearest,
 }
 
 /// A resampler that us used to resample a chunk of audio to a new sample rate.

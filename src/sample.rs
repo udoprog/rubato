@@ -21,6 +21,7 @@ where
         + std::ops::DivAssign
         + std::ops::SubAssign
         + std::ops::AddAssign
+        + std::iter::Sum
         + AvxSample
         + SseSample
         + NeonSample,

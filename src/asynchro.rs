@@ -43,29 +43,16 @@ where
     fn get_sinc_interpolated(&self, wave: &[T], index: usize, subindex: usize) -> T {
         let wave_cut = &wave[index..(index + self.sincs[subindex].len())];
         let sinc = &self.sincs[subindex];
-        unsafe {
-            let mut acc0 = T::zero();
-            let mut acc1 = T::zero();
-            let mut acc2 = T::zero();
-            let mut acc3 = T::zero();
-            let mut acc4 = T::zero();
-            let mut acc5 = T::zero();
-            let mut acc6 = T::zero();
-            let mut acc7 = T::zero();
-            let mut idx = 0;
-            for _ in 0..wave_cut.len() / 8 {
-                acc0 += *wave_cut.get_unchecked(idx) * *sinc.get_unchecked(idx);
-                acc1 += *wave_cut.get_unchecked(idx + 1) * *sinc.get_unchecked(idx + 1);
-                acc2 += *wave_cut.get_unchecked(idx + 2) * *sinc.get_unchecked(idx + 2);
-                acc3 += *wave_cut.get_unchecked(idx + 3) * *sinc.get_unchecked(idx + 3);
-                acc4 += *wave_cut.get_unchecked(idx + 4) * *sinc.get_unchecked(idx + 4);
-                acc5 += *wave_cut.get_unchecked(idx + 5) * *sinc.get_unchecked(idx + 5);
-                acc6 += *wave_cut.get_unchecked(idx + 6) * *sinc.get_unchecked(idx + 6);
-                acc7 += *wave_cut.get_unchecked(idx + 7) * *sinc.get_unchecked(idx + 7);
-                idx += 8;
+
+        let mut acc = [T::zero(); 8];
+
+        for (wave_cut, sinc) in wave_cut.chunks_exact(8).zip(sinc.chunks_exact(8)) {
+            for (acc, (w, s)) in acc.iter_mut().zip(wave_cut.iter().zip(sinc)) {
+                *acc += *w * *s;
             }
-            acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7
         }
+
+        std::array::IntoIter::new(acc).sum()
     }
 
     fn len(&self) -> usize {

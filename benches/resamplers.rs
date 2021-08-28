@@ -15,18 +15,32 @@ use rubato::{FftFixedIn, InterpolationType, Resampler, SincFixedIn, WindowFuncti
 fn bench_fftfixedin(c: &mut Criterion) {
     let chunksize = 1024;
     let mut resampler = FftFixedIn::<f64>::new(44100, 192000, 1024, 2, 1);
-    let waveform = vec![vec![0.0 as f64; chunksize]; 1];
+    let waveform = audio::wrap::dynamic(vec![vec![0.0 as f64; chunksize]; 1]);
+    let mut buf = audio::buf::Dynamic::with_topology(1, chunksize);
+    let mask = bittle::all();
+
     c.bench_function("FftFixedIn f64", |b| {
-        b.iter(|| resampler.process(&waveform).unwrap())
+        b.iter(|| {
+            resampler
+                .process_with_buffer(&waveform, &mut buf, &mask)
+                .unwrap()
+        })
     });
 }
 
 fn bench_fftfixedin_32(c: &mut Criterion) {
     let chunksize = 1024;
     let mut resampler = FftFixedIn::<f32>::new(44100, 192000, 1024, 2, 1);
-    let waveform = vec![vec![0.0 as f32; chunksize]; 1];
+    let waveform = audio::wrap::dynamic(vec![vec![0.0 as f32; chunksize]; 1]);
+    let mut buf = audio::buf::Dynamic::with_topology(1, chunksize);
+    let mask = bittle::all();
+
     c.bench_function("FftFixedIn f32", |b| {
-        b.iter(|| resampler.process(&waveform).unwrap())
+        b.iter(|| {
+            resampler
+                .process_with_buffer(&waveform, &mut buf, &mask)
+                .unwrap()
+        })
     });
 }
 
@@ -66,8 +80,11 @@ macro_rules! bench_async_resampler {
                 chunksize,
                 1,
             );
-            let waveform = vec![vec![0.0 as $ft; chunksize]; 1];
-            c.bench_function($desc, |b| b.iter(|| resampler.process(&waveform).unwrap()));
+            let waveform = audio::dynamic![[0.0 as $ft; chunksize]; 1];
+            let mut buf = audio::buf::Dynamic::with_topology(1, chunksize);
+            let mask = bittle::all();
+
+            c.bench_function($desc, |b| b.iter(|| resampler.process_with_buffer(&waveform, &mut buf, &mask).unwrap()));
         }
     };
 }

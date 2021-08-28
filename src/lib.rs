@@ -63,8 +63,8 @@
 //!     2,
 //! );
 //!
-//! let waves_in = vec![vec![0.0f64; 1024];2];
-//! let waves_out = resampler.process(&waves_in).unwrap();
+//! let waves_in = audio::wrap::dynamic(vec![vec![0.0f64; 1024];2]);
+//! let waves_out = resampler.process(&waves_in, &bittle::all()).unwrap();
 //! ```
 //!
 //! ## Compatibility
@@ -77,11 +77,13 @@
 mod asynchro;
 mod error;
 mod interpolation;
+mod interpolation_type;
 mod sample;
 mod sinc;
 mod synchro;
 mod windows;
 
+pub use self::interpolation_type::InterpolationType;
 pub use crate::asynchro::{ScalarInterpolator, SincFixedIn, SincFixedOut};
 pub use crate::error::{CpuFeature, MissingCpuFeature, ResampleError, ResampleResult};
 pub use crate::sample::Sample;
@@ -158,49 +160,110 @@ pub struct InterpolationParameters {
     pub window: WindowFunction,
 }
 
-/// Interpolation methods that can be selected. For asynchronous interpolation where the
-/// ratio between inut and output sample rates can be any number, it's not possible to
-/// pre-calculate all the needed interpolation filters.
-/// Instead they have to be computed as needed, which becomes impractical since the
-/// sincs are very expensive to generate in terms of cpu time.
-/// It's more efficient to combine the sinc filters with some other interpolation technique.
-/// Then sinc filters are used to provide a fixed number of interpolated points between input samples,
-/// and then the new value is calculated by interpolation between those points.
-#[derive(Debug)]
-pub enum InterpolationType {
-    /// For cubic interpolation, the four nearest intermediate points are calculated
-    /// using sinc interpolation.
-    /// Then a cubic polynomial is fitted to these points, and is then used to calculate the new sample value.
-    /// The computation time as about twice the one for linear interpolation,
-    /// but it requires much fewer intermediate points for a good result.
-    Cubic,
-    /// With linear interpolation the new sample value is calculated by linear interpolation
-    /// between the two nearest points.
-    /// This requires two intermediate points to be calcuated using sinc interpolation,
-    /// and te output is a weighted average of these two.
-    /// This is relatively fast, but needs a large number of intermediate points to
-    /// push the resampling artefacts below the noise floor.
-    Linear,
-    /// The Nearest mode doesn't do any interpolation, but simply picks the nearest intermediate point.
-    /// This is useful when the nearest point is actually the correct one, for example when upsampling by a factor 2,
-    /// like 48kHz->96kHz.
-    /// Then setting the oversampling_factor to 2, and using Nearest mode,
-    /// no unneccesary computations are performed and the result is the same as for synchronous resampling.
-    /// This also works for other ratios that can be expressed by a fraction. For 44.1kHz -> 48 kHz,
-    /// setting oversampling_factor to 160 gives the desired result (since 48kHz = 160/147 * 44.1kHz).
-    Nearest,
+/// A dynamic object-safe typed [Resampler] where `B` has to be specified.
+pub trait DynResampler<T, I = Vec<Vec<T>>, O = audio::buf::Dynamic<T>, M = bittle::FixedSet<u128>>
+where
+    T: audio_core::Sample,
+    I: audio_core::Buf<Sample = T>,
+    O: audio_core::BufMut<Sample = T>,
+    M: bittle::Mask,
+{
+    /// Resample a chunk of audio.
+    fn process(&mut self, wave_in: &I, mask: &M) -> ResampleResult<Vec<Vec<T>>>;
+
+    /// Resample a chunk of audio with a custom output buffer.
+    fn process_with_buffer(
+        &mut self,
+        wave_in: &I,
+        wave_out: &mut O,
+        mask: &M,
+    ) -> ResampleResult<()>;
+
+    /// Query for the number of frames needed for the next call to "process".
+    fn nbr_frames_needed(&self) -> usize;
+
+    /// Update the resample ratio.
+    fn set_resample_ratio(&mut self, new_ratio: f64) -> ResampleResult<()>;
+
+    /// Update the resample ratio relative to the original one.
+    fn set_resample_ratio_relative(&mut self, rel_ratio: f64) -> ResampleResult<()>;
+}
+
+impl<T, I, O, R, M> DynResampler<T, I, O, M> for R
+where
+    R: Resampler<T>,
+    T: audio_core::Sample,
+    I: audio_core::Buf<Sample = T>,
+    O: audio_core::BufMut<Sample = T> + audio_core::ResizableBuf,
+    M: bittle::Mask,
+{
+    /// Resample a chunk of audio. Input and output data is stored in a vector,
+    /// where each element contains a vector with all samples for a single channel.
+    fn process(&mut self, wave_in: &I, mask: &M) -> ResampleResult<Vec<Vec<T>>> {
+        let mut wave_out = audio::buf::Dynamic::<T>::new();
+        <Self as Resampler<T>>::process_with_buffer(self, wave_in, &mut wave_out, mask)?;
+        Ok(wave_out.into_vectors_if(|n| mask.test(n)))
+    }
+
+    fn process_with_buffer(
+        &mut self,
+        wave_in: &I,
+        wave_out: &mut O,
+        mask: &M,
+    ) -> ResampleResult<()> {
+        <Self as Resampler<T>>::process_with_buffer(self, wave_in, wave_out, mask)
+    }
+
+    /// Query for the number of frames needed for the next call to "process".
+    fn nbr_frames_needed(&self) -> usize {
+        <Self as Resampler<T>>::nbr_frames_needed(self)
+    }
+
+    /// Update the resample ratio.
+    fn set_resample_ratio(&mut self, new_ratio: f64) -> ResampleResult<()> {
+        <Self as Resampler<T>>::set_resample_ratio(self, new_ratio)
+    }
+
+    /// Update the resample ratio relative to the original one.
+    fn set_resample_ratio_relative(&mut self, rel_ratio: f64) -> ResampleResult<()> {
+        <Self as Resampler<T>>::set_resample_ratio_relative(self, rel_ratio)
+    }
 }
 
 /// A resampler that us used to resample a chunk of audio to a new sample rate.
 /// The rate can be adjusted as required.
-pub trait Resampler<T> {
-    /// Resample a chunk of audio.
+pub trait Resampler<T>
+where
+    T: audio_core::Sample,
+{
+    /// Resample a chunk of audio. Input and output data is stored in a vector,
+    /// where each element contains a vector with all samples for a single channel.
+    fn process<B, M: ?Sized>(&mut self, wave_in: B, mask: &M) -> ResampleResult<Vec<Vec<T>>>
+    where
+        Self: Sized,
+        B: audio_core::Buf<Sample = T>,
+        M: bittle::Mask,
+    {
+        let mut wave_out = audio::buf::Dynamic::<T>::new();
+        self.process_with_buffer(wave_in, &mut wave_out, mask)?;
+        Ok(wave_out.into_vectors_if(|n| mask.test(n)))
+    }
+
+    /// Resample a chunk of audio. Input and output data is stored in a vector,
+    /// where each element contains a vector with all samples for a single channel.
     ///
-    /// The input data is a slice, where each element of the slice is itself referenceable as a slice
-    /// ([`AsRef<[T]>`](AsRef)) which contains the samples for a single channel. Since [`Vec<T>`] implements
-    /// [`AsRef<[T]>`](AsRef), the input may simply be `&*Vec<Vec<T>>`. The output data is a vector, where each element
-    /// of the vector is itself a vector which contains the samples for a single channel.
-    fn process<V: AsRef<[T]>>(&mut self, wave_in: &[V]) -> ResampleResult<Vec<Vec<T>>>;
+    /// This variant works with an output buffer in-place.
+    fn process_with_buffer<B, O, M: ?Sized>(
+        &mut self,
+        wave_in: B,
+        wave_out: O,
+        mask: &M,
+    ) -> ResampleResult<()>
+    where
+        Self: Sized,
+        B: audio_core::Buf<Sample = T>,
+        O: audio_core::BufMut<Sample = T> + audio_core::ResizableBuf,
+        M: bittle::Mask;
 
     /// Query for the number of frames needed for the next call to "process".
     fn nbr_frames_needed(&self) -> usize;

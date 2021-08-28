@@ -27,23 +27,26 @@ use log::LevelFilter;
 ///! python examples/analyze_result.py test.raw 2 192000 64
 ///! ```
 
-fn read_frames<R: Read + Seek>(inbuffer: &mut R, nbr: usize, channels: usize) -> Vec<Vec<f64>> {
+fn read_frames<R: Read + Seek>(
+    inbuffer: &mut R,
+    nbr: usize,
+    channels: usize,
+) -> audio::buf::Dynamic<f64> {
     let mut buffer = vec![0u8; 8];
-    let mut wfs = Vec::with_capacity(channels);
-    for _chan in 0..channels {
-        wfs.push(Vec::with_capacity(nbr));
-    }
-    let mut value: f64;
-    for _frame in 0..nbr {
-        for wf in wfs.iter_mut().take(channels) {
+    let mut wfs = audio::buf::Dynamic::with_topology(channels, nbr);
+
+    for n in 0..nbr {
+        for mut wf in &mut wfs {
             if inbuffer.read(&mut buffer).unwrap() < 8 {
                 return wfs;
             }
-            value = f64::from_le_bytes(buffer.as_slice().try_into().unwrap()) as f64;
-            //idx += 8;
-            wf.push(value);
+
+            if let Some(f) = wf.get_mut(n) {
+                *f = f64::from_le_bytes(buffer.as_slice().try_into().unwrap());
+            }
         }
     }
+
     wfs
 }
 
@@ -117,7 +120,7 @@ fn main() {
         if waves[0].len() < nbr_frames {
             break;
         }
-        let waves_out = resampler.process(&waves).unwrap();
+        let waves_out = resampler.process(&waves, &bittle::all()).unwrap();
         //println!("got {} frames", waves_out[0].len());
         write_frames(waves_out, &mut f_out, channels);
     }

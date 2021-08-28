@@ -23,6 +23,9 @@ realfft = "2.0.0"
 num-complex = "0.4"
 num-integer = "0.1.44"
 num-traits = "0.2"
+audio = { git = "https://github.com/udoprog/audio", branch = "main" }
+audio-core = { git = "https://github.com/udoprog/audio", branch = "main" }
+bittle = "0.2.1"
 
 [dev-dependencies] 
 env_logger = "0.9.0"

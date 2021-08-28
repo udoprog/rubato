@@ -19,7 +19,7 @@ static FEATURES: &[CpuFeature] = &[CpuFeature::Avx, CpuFeature::Fma];
 
 /// Trait governing what can be done with an AvxSample.
 pub trait AvxSample: Sized {
-    type Sinc;
+    type Sinc: Send + Sync;
 
     /// Pack sincs into a vector.
     /// 

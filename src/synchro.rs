@@ -1,5 +1,6 @@
 use crate::sinc::make_sincs;
 use crate::windows::WindowFunction;
+use audio_core::{Channel, ChannelMut};
 use num_complex::Complex;
 use num_integer as integer;
 use num_traits::Zero;
@@ -30,13 +31,16 @@ struct FftResampler<T> {
 /// The resampling is done by FFT:ing the input data. The spectrum is then extended or
 /// truncated as well as multiplied with an antialiasing filter
 /// before it's inverse transformed to get the resampled waveforms.
-pub struct FftFixedIn<T> {
+pub struct FftFixedIn<T>
+where
+    T: audio_core::Sample,
+{
     nbr_channels: usize,
     chunk_size_in: usize,
     fft_size_in: usize,
     fft_size_out: usize,
-    overlaps: Vec<Vec<T>>,
-    input_buffers: Vec<Vec<T>>,
+    overlaps: audio::buf::Dynamic<T>,
+    input_buffers: audio::buf::Dynamic<T>,
     saved_frames: usize,
     resampler: FftResampler<T>,
 }
@@ -47,13 +51,16 @@ pub struct FftFixedIn<T> {
 /// The resampling is done by FFT:ing the input data. The spectrum is then extended or
 /// truncated as well as multiplied with an antialiasing filter
 /// before it's inverse transformed to get the resampled waveforms.
-pub struct FftFixedOut<T> {
+pub struct FftFixedOut<T>
+where
+    T: Sample,
+{
     nbr_channels: usize,
     chunk_size_out: usize,
     fft_size_in: usize,
     fft_size_out: usize,
-    overlaps: Vec<Vec<T>>,
-    output_buffers: Vec<Vec<T>>,
+    overlaps: audio::buf::Dynamic<T>,
+    output_buffers: audio::buf::Dynamic<T>,
     saved_frames: usize,
     frames_needed: usize,
     resampler: FftResampler<T>,
@@ -65,12 +72,15 @@ pub struct FftFixedOut<T> {
 /// The resampling is done by FFT:ing the input data. The spectrum is then extended or
 /// truncated as well as multiplied with an antialiasing filter
 /// before it's inverse transformed to get the resampled waveforms.
-pub struct FftFixedInOut<T> {
+pub struct FftFixedInOut<T>
+where
+    T: Sample,
+{
     nbr_channels: usize,
     chunk_size_in: usize,
     chunk_size_out: usize,
     fft_size_in: usize,
-    overlaps: Vec<Vec<T>>,
+    overlaps: audio::buf::Dynamic<T>,
     resampler: FftResampler<T>,
 }
 
@@ -124,9 +134,17 @@ where
     }
 
     /// Resample a small chunk
-    fn resample_unit(&mut self, wave_in: &[T], wave_out: &mut [T], overlap: &mut [T]) {
-        // Copy to input buffer and clear padding area
-        self.input_buf[0..self.fft_size_in].copy_from_slice(wave_in);
+    fn resample_unit(
+        &mut self,
+        overlap: &mut [T],
+        inp: impl Channel<Sample = T>,
+        out: impl ChannelMut<Sample = T>,
+    ) {
+        audio::channel::copy(
+            inp,
+            audio::channel::LinearChannelMut::new(&mut self.input_buf[..self.fft_size_in]),
+        );
+
         for item in self
             .input_buf
             .iter_mut()
@@ -168,9 +186,14 @@ where
                 &mut self.scratch_inv,
             )
             .unwrap();
-        for (n, item) in wave_out.iter_mut().enumerate().take(self.fft_size_out) {
-            *item = self.output_buf[n] + overlap[n];
-        }
+
+        let it = self
+            .output_buf
+            .iter()
+            .zip(overlap.iter())
+            .map(|(a, b)| *a + *b)
+            .take(self.fft_size_out);
+        audio::channel::copy_iter(it, out);
         overlap.copy_from_slice(&self.output_buf[self.fft_size_out..]);
     }
 }
@@ -201,7 +224,7 @@ where
 
         let resampler = FftResampler::<T>::new(fft_size_in, fft_size_out);
 
-        let overlaps: Vec<Vec<T>> = vec![vec![T::zero(); fft_size_out]; nbr_channels];
+        let overlaps = audio::buf::Dynamic::with_topology(nbr_channels, fft_size_out);
 
         FftFixedInOut {
             nbr_channels,
@@ -218,11 +241,6 @@ impl<T> Resampler<T> for FftFixedInOut<T>
 where
     T: Sample,
 {
-    /// Query for the number of frames needed for the next call to "process".
-    fn nbr_frames_needed(&self) -> usize {
-        self.fft_size_in
-    }
-
     /// Resample a chunk of audio. The input and output lengths are fixed.
     /// If the waveform for a channel is empty, this channel will be ignored and produce a
     /// corresponding empty output waveform.
@@ -230,40 +248,52 @@ where
     ///
     /// The function returns an error if the size of the input data is not equal
     /// to the number of channels and input size defined when creating the instance.
-    fn process<V: AsRef<[T]>>(&mut self, wave_in: &[V]) -> ResampleResult<Vec<Vec<T>>> {
-        if wave_in.len() != self.nbr_channels {
+    fn process_with_buffer<B, O, M: ?Sized>(
+        &mut self,
+        wave_in: B,
+        mut wave_out: O,
+        mask: &M,
+    ) -> ResampleResult<()>
+    where
+        B: audio_core::Buf<Sample = T>,
+        O: audio_core::BufMut<Sample = T> + audio_core::ResizableBuf,
+        M: bittle::Mask,
+    {
+        if wave_in.channels() != self.nbr_channels {
             return Err(ResampleError::WrongNumberOfChannels {
                 expected: self.nbr_channels,
-                actual: wave_in.len(),
+                actual: wave_in.channels(),
             });
         }
-        let mut used_channels = Vec::new();
-        for (chan, wave) in wave_in.iter().enumerate() {
-            let wave = wave.as_ref();
-            if !wave.is_empty() {
-                used_channels.push(chan);
-                if wave.len() != self.chunk_size_in {
-                    return Err(ResampleError::WrongNumberOfFrames {
-                        channel: chan,
-                        expected: self.chunk_size_in,
-                        actual: wave.len(),
-                    });
-                }
+
+        for (chan, wave) in mask.join(wave_in.iter_channels().enumerate()) {
+            if wave.len() != self.chunk_size_in {
+                return Err(ResampleError::WrongNumberOfFrames {
+                    channel: chan,
+                    expected: self.chunk_size_in,
+                    actual: wave.len(),
+                });
             }
         }
-        let mut wave_out = vec![Vec::new(); self.nbr_channels];
-        for chan in used_channels.iter() {
-            wave_out[*chan] = vec![T::zero(); self.chunk_size_out];
+
+        wave_out.resize_topology(wave_in.channels(), self.chunk_size_out);
+
+        for ((wave_out, wave_in), mut overlap) in mask.join(
+            wave_out
+                .iter_channels_mut()
+                .zip(wave_in.iter_channels())
+                .zip(self.overlaps.iter_channels_mut()),
+        ) {
+            self.resampler
+                .resample_unit(overlap.as_mut(), wave_in, wave_out)
         }
 
-        for n in used_channels.iter() {
-            self.resampler.resample_unit(
-                wave_in[*n].as_ref(),
-                &mut wave_out[*n],
-                &mut self.overlaps[*n],
-            )
-        }
-        Ok(wave_out)
+        Ok(())
+    }
+
+    /// Query for the number of frames needed for the next call to "process".
+    fn nbr_frames_needed(&self) -> usize {
+        self.fft_size_in
     }
 
     /// Update the resample ratio. This is not supported by this resampler and
@@ -312,9 +342,9 @@ where
             fs_in, fs_out, chunk_size_out, nbr_channels, fft_size_in, fft_size_out
         );
 
-        let overlaps: Vec<Vec<T>> = vec![vec![T::zero(); fft_size_out]; nbr_channels];
-        let output_buffers: Vec<Vec<T>> =
-            vec![vec![T::zero(); chunk_size_out + fft_size_out]; nbr_channels];
+        let overlaps = audio::buf::Dynamic::with_topology(nbr_channels, fft_size_out);
+        let output_buffers =
+            audio::buf::Dynamic::with_topology(nbr_channels, chunk_size_out + fft_size_out);
 
         let saved_frames = 0;
         let chunks_needed = (chunk_size_out as f32 / fft_size_out as f32).ceil() as usize;
@@ -338,11 +368,6 @@ impl<T> Resampler<T> for FftFixedOut<T>
 where
     T: Sample,
 {
-    /// Query for the number of frames needed for the next call to "process".
-    fn nbr_frames_needed(&self) -> usize {
-        self.frames_needed
-    }
-
     /// Resample a chunk of audio. The required input length is provided by
     /// the "nbr_frames_needed" function, and the output length is fixed.
     /// If the waveform for a channel is empty, this channel will be ignored and produce a
@@ -352,58 +377,87 @@ where
     /// The function returns an error if the length of the input data is not
     /// equal to the number of channels defined when creating the instance,
     /// and the number of audio frames given by "nbr_frames_needed".
-    fn process<V: AsRef<[T]>>(&mut self, wave_in: &[V]) -> ResampleResult<Vec<Vec<T>>> {
-        if wave_in.len() != self.nbr_channels {
+    fn process_with_buffer<B, O, M: ?Sized>(
+        &mut self,
+        wave_in: B,
+        mut wave_out: O,
+        mask: &M,
+    ) -> ResampleResult<()>
+    where
+        B: audio_core::Buf<Sample = T>,
+        O: audio_core::BufMut<Sample = T> + audio_core::ResizableBuf,
+        M: bittle::Mask,
+    {
+        if wave_in.channels() != self.nbr_channels {
             return Err(ResampleError::WrongNumberOfChannels {
                 expected: self.nbr_channels,
-                actual: wave_in.len(),
+                actual: wave_in.channels(),
             });
         }
-        let mut used_channels = Vec::new();
-        for (chan, wave) in wave_in.iter().enumerate() {
-            let wave = wave.as_ref();
-            if !wave.is_empty() {
-                used_channels.push(chan);
-                if wave.len() != self.frames_needed {
-                    return Err(ResampleError::WrongNumberOfFrames {
-                        channel: chan,
-                        expected: self.frames_needed,
-                        actual: wave.len(),
-                    });
-                }
+
+        for (chan, wave) in mask.join(wave_in.iter_channels().enumerate()) {
+            if wave.len() != self.frames_needed {
+                return Err(ResampleError::WrongNumberOfFrames {
+                    channel: chan,
+                    expected: self.frames_needed,
+                    actual: wave.len(),
+                });
             }
         }
 
-        let mut wave_out = vec![Vec::new(); self.nbr_channels];
-        for chan in used_channels.iter() {
-            wave_out[*chan] = self.output_buffers[*chan].clone();
-        }
+        wave_out.resize_topology(self.nbr_channels, self.output_buffers.frames());
 
-        for n in used_channels.iter() {
-            for (in_chunk, out_chunk) in wave_in[*n]
-                .as_ref()
-                .chunks(self.fft_size_in)
-                .zip(wave_out[*n][self.saved_frames..].chunks_mut(self.fft_size_out))
-            {
-                self.resampler
-                    .resample_unit(in_chunk, out_chunk, &mut self.overlaps[*n]);
+        let it = wave_out
+            .iter_channels_mut()
+            .zip(self.output_buffers.iter_channels())
+            .zip(wave_in.iter_channels())
+            .zip(self.overlaps.iter_channels_mut());
+
+        let fft_size_out = self.resampler.fft_size_out;
+
+        for (((mut wave_out, output_buffer), wave_in), mut overlap) in mask.join(it) {
+            audio::channel::copy(output_buffer, wave_out.as_channel_mut());
+
+            let chunk = self.fft_size_out;
+            let chunks = chunks(wave_in.len(), chunk);
+
+            let mut wave_out = wave_out.skip(self.saved_frames);
+
+            for n in 0..chunks {
+                let wave_out = &mut wave_out;
+
+                self.resampler.resample_unit(
+                    overlap.as_mut(),
+                    wave_in.as_channel().skip(n * chunk).limit(chunk),
+                    wave_out
+                        .as_channel_mut()
+                        .skip(n * fft_size_out)
+                        .limit(fft_size_out),
+                );
             }
         }
+
         let processed_frames =
             self.saved_frames + self.fft_size_out * (self.frames_needed / self.fft_size_in);
 
         // save extra frames for next round
         self.saved_frames = processed_frames - self.chunk_size_out;
+
         if processed_frames > self.chunk_size_out {
-            for n in used_channels.iter() {
-                self.output_buffers[*n][0..self.saved_frames].copy_from_slice(
-                    &wave_out[*n][self.chunk_size_out..(self.chunk_size_out + self.saved_frames)],
+            for (wave_out, out) in mask.join(
+                wave_out
+                    .iter_channels()
+                    .zip(self.output_buffers.iter_channels_mut()),
+            ) {
+                audio::channel::copy(
+                    wave_out.skip(self.chunk_size_out).limit(self.saved_frames),
+                    out.limit(self.saved_frames),
                 );
             }
         }
-        for n in used_channels.iter() {
-            wave_out[*n].truncate(self.chunk_size_out);
-        }
+
+        wave_out.resize(self.chunk_size_out);
+
         //calculate number of needed frames from next round
         let frames_needed_out = if self.chunk_size_out > self.saved_frames {
             self.chunk_size_out - self.saved_frames
@@ -412,7 +466,12 @@ where
         };
         let chunks_needed = (frames_needed_out as f32 / self.fft_size_out as f32).ceil() as usize;
         self.frames_needed = chunks_needed * self.fft_size_in;
-        Ok(wave_out)
+        Ok(())
+    }
+
+    /// Query for the number of frames needed for the next call to "process".
+    fn nbr_frames_needed(&self) -> usize {
+        self.frames_needed
     }
 
     /// Update the resample ratio. This is not supported by this resampler and
@@ -460,9 +519,9 @@ where
             fs_in, fs_out, chunk_size_in, nbr_channels, fft_size_in, fft_size_out
         );
 
-        let overlaps: Vec<Vec<T>> = vec![vec![T::zero(); fft_size_out]; nbr_channels];
-        let input_buffers: Vec<Vec<T>> =
-            vec![vec![T::zero(); chunk_size_in + fft_size_out]; nbr_channels];
+        let overlaps = audio::buf::Dynamic::with_topology(nbr_channels, fft_size_out);
+        let input_buffers =
+            audio::buf::Dynamic::with_topology(nbr_channels, chunk_size_in + fft_size_out);
 
         let saved_frames = 0;
 
@@ -483,104 +542,106 @@ impl<T> Resampler<T> for FftFixedIn<T>
 where
     T: Sample,
 {
-    /// Query for the number of frames needed for the next call to "process".
-    fn nbr_frames_needed(&self) -> usize {
-        self.chunk_size_in
-    }
-
-    /// Resample a chunk of audio. The required input length is provided by
-    /// the "nbr_frames_needed" function, and the output length is fixed.
-    /// If the waveform for a channel is empty, this channel will be ignored and produce a
-    /// corresponding empty output waveform.
-    /// # Errors
-    ///
-    /// The function returns an error if the length of the input data is not
-    /// equal to the number of channels defined when creating the instance,
-    /// and the number of audio frames given by "nbr_frames_needed".
-    fn process<V: AsRef<[T]>>(&mut self, wave_in: &[V]) -> ResampleResult<Vec<Vec<T>>> {
-        if wave_in.len() != self.nbr_channels {
+    fn process_with_buffer<B, O, M: ?Sized>(
+        &mut self,
+        wave_in: B,
+        mut wave_out: O,
+        mask: &M,
+    ) -> ResampleResult<()>
+    where
+        B: audio_core::Buf<Sample = T>,
+        O: audio_core::BufMut<Sample = T> + audio_core::ResizableBuf,
+        M: bittle::Mask,
+    {
+        if wave_in.channels() != self.nbr_channels {
             return Err(ResampleError::WrongNumberOfChannels {
                 expected: self.nbr_channels,
-                actual: wave_in.len(),
+                actual: wave_in.channels(),
             });
         }
-        let mut used_channels = Vec::new();
-        for (chan, wave) in wave_in.iter().enumerate() {
-            let wave = wave.as_ref();
-            if !wave.is_empty() {
-                used_channels.push(chan);
-                if wave.len() != self.chunk_size_in {
-                    return Err(ResampleError::WrongNumberOfFrames {
-                        channel: chan,
-                        expected: self.chunk_size_in,
-                        actual: wave.len(),
-                    });
-                }
+
+        for (chan, wave) in mask.join(wave_in.iter_channels().enumerate()) {
+            if wave.len() != self.chunk_size_in {
+                return Err(ResampleError::WrongNumberOfFrames {
+                    channel: chan,
+                    expected: self.chunk_size_in,
+                    actual: wave.len(),
+                });
             }
         }
 
-        let mut input_temp = vec![Vec::new(); self.nbr_channels];
-        for chan in used_channels.iter() {
-            input_temp[*chan] = vec![T::zero(); self.saved_frames + self.chunk_size_in];
-        }
+        let mut input_temp = audio::buf::Sequential::with_topology(
+            self.nbr_channels,
+            self.saved_frames + self.chunk_size_in,
+        );
+
+        let it = input_temp
+            .iter_channels_mut()
+            .zip(self.input_buffers.iter_channels())
+            .zip(wave_in.iter_channels());
 
         // copy new samples to input buffer
-        for n in used_channels.iter() {
-            for (input, buffer) in self.input_buffers[*n]
-                .iter()
-                .take(self.saved_frames)
-                .zip(input_temp[*n].iter_mut())
-            {
-                *buffer = *input;
-            }
+        for ((mut temp, input), wave) in mask.join(it) {
+            audio::channel::copy(
+                input.limit(self.saved_frames),
+                temp.as_channel_mut().limit(self.saved_frames),
+            );
+            audio::channel::copy(wave, temp.skip(self.saved_frames).limit(self.chunk_size_in));
         }
-        for n in used_channels.iter() {
-            for (input, buffer) in wave_in[*n].as_ref().iter().zip(
-                input_temp[*n]
-                    .iter_mut()
-                    .skip(self.saved_frames)
-                    .take(self.chunk_size_in),
-            ) {
-                *buffer = *input;
-            }
-        }
+
         self.saved_frames += self.chunk_size_in;
 
         let nbr_chunks_ready =
             (self.saved_frames as f32 / self.fft_size_in as f32).floor() as usize;
-        let mut wave_out = vec![Vec::new(); self.nbr_channels];
-        for chan in used_channels.iter() {
-            wave_out[*chan] = vec![T::zero(); nbr_chunks_ready * self.fft_size_out];
-        }
-        for n in used_channels.iter() {
-            for (in_chunk, out_chunk) in input_temp[*n]
-                .chunks(self.fft_size_in)
-                .take(nbr_chunks_ready)
-                .zip(wave_out[*n].chunks_mut(self.fft_size_out))
-            {
-                self.resampler
-                    .resample_unit(in_chunk, out_chunk, &mut self.overlaps[*n]);
+
+        wave_out.resize_topology(wave_in.channels(), nbr_chunks_ready * self.fft_size_out);
+
+        let it = wave_out
+            .iter_channels_mut()
+            .zip(input_temp.iter_channels())
+            .zip(self.overlaps.iter_channels_mut());
+
+        let fft_size_out = self.resampler.fft_size_out;
+
+        for ((wave_out, input_temp), mut overlap) in mask.join(it) {
+            let mut wave_out = wave_out.skip(self.saved_frames);
+            let chunks = chunks(wave_out.len(), self.fft_size_out);
+
+            for n in 0..chunks {
+                self.resampler.resample_unit(
+                    overlap.as_mut(),
+                    input_temp
+                        .skip(n * self.fft_size_in)
+                        .limit(self.fft_size_in),
+                    wave_out
+                        .as_channel_mut()
+                        .skip(n * fft_size_out)
+                        .limit(fft_size_out),
+                );
             }
         }
 
         // save extra frames for next round
         let frames_in_used = nbr_chunks_ready * self.fft_size_in;
-        let extra = self.saved_frames - frames_in_used;
+        let extra = self.saved_frames.saturating_sub(frames_in_used);
 
         if self.saved_frames > frames_in_used {
-            for n in used_channels.iter() {
-                for (input, buffer) in input_temp[*n]
-                    .iter()
-                    .skip(frames_in_used)
-                    .take(extra)
-                    .zip(self.input_buffers[*n].iter_mut())
-                {
-                    *buffer = *input;
-                }
+            let it = input_temp
+                .iter_channels()
+                .zip(self.input_buffers.iter_channels_mut());
+
+            for (inp, out) in mask.join(it) {
+                audio::channel::copy(inp.skip(frames_in_used).limit(extra), out);
             }
         }
+
         self.saved_frames = extra;
-        Ok(wave_out)
+        Ok(())
+    }
+
+    /// Query for the number of frames needed for the next call to "process".
+    fn nbr_frames_needed(&self) -> usize {
+        self.chunk_size_in
     }
 
     /// Update the resample ratio. This is not supported by this resampler and
@@ -593,6 +654,14 @@ where
     /// supported by this resampler and always returns an error.
     fn set_resample_ratio_relative(&mut self, _rel_ratio: f64) -> ResampleResult<()> {
         Err(ResampleError::SyncNotAdjustable)
+    }
+}
+
+fn chunks(len: usize, window: usize) -> usize {
+    if len % window == 0 {
+        len / window
+    } else {
+        len / window + 1
     }
 }
 
@@ -615,7 +684,11 @@ mod tests {
 
         let mut wave_out = vec![0.0; 1000];
         let mut overlap = vec![0.0; 1000];
-        resampler.resample_unit(&wave_in, &mut wave_out, &mut overlap);
+        resampler.resample_unit(
+            &mut overlap,
+            audio::channel::LinearChannel::new(&wave_in[..]),
+            audio::channel::LinearChannelMut::new(&mut wave_out[..]),
+        );
         let vecsum = wave_out.iter().sum::<f64>();
         let maxval = wave_out.iter().cloned().fold(0. / 0., f64::max);
         assert!((vecsum - 4.0 * 1000.0 / 147.0).abs() < 1.0e-6);
@@ -627,8 +700,8 @@ mod tests {
         // asking for 1024 give the nearest which is 1029 -> 1120
         let mut resampler = FftFixedInOut::<f64>::new(44100, 48000, 1024, 2);
         let frames = resampler.nbr_frames_needed();
-        let waves = vec![vec![0.0f64; frames]; 2];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::dynamic![[0.0f64; frames]; 2];
+        let out = resampler.process(&waves, &bittle::all()).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 1120);
     }
@@ -638,8 +711,9 @@ mod tests {
         // asking for 1024 give the nearest which is 1029 -> 1120
         let mut resampler = FftFixedInOut::<f64>::new(44100, 48000, 1024, 2);
         let frames = resampler.nbr_frames_needed();
-        let waves = vec![vec![0.0f64; frames], Vec::new()];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::wrap::dynamic(vec![vec![0.0f64; frames], Vec::new()]);
+        let mask: bittle::FixedSet<u128> = bittle::fixed_set![0];
+        let out = resampler.process(&waves, &mask).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 1120);
         assert!(out[1].is_empty());
@@ -650,8 +724,8 @@ mod tests {
         let mut resampler = FftFixedOut::<f64>::new(44100, 192000, 1024, 2, 2);
         let frames = resampler.nbr_frames_needed();
         assert_eq!(frames, 294);
-        let waves = vec![vec![0.0f64; frames]; 2];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::dynamic![[0.0f64; frames]; 2];
+        let out = resampler.process(&waves, &bittle::all()).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 1024);
     }
@@ -661,8 +735,9 @@ mod tests {
         let mut resampler = FftFixedOut::<f64>::new(44100, 192000, 1024, 2, 2);
         let frames = resampler.nbr_frames_needed();
         assert_eq!(frames, 294);
-        let waves = vec![vec![0.0f64; frames], Vec::new()];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::wrap::dynamic(vec![vec![0.0f64; frames], Vec::new()]);
+        let mask: bittle::FixedSet<u128> = bittle::fixed_set![0];
+        let out = resampler.process(&waves, &mask).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 1024);
         assert!(out[1].is_empty());
@@ -673,8 +748,8 @@ mod tests {
         let mut resampler = FftFixedOut::<f64>::new(44100, 192000, 1024, 2, 2);
         let frames = resampler.nbr_frames_needed();
         assert_eq!(frames, 294);
-        let waves = vec![Vec::new(); 2];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::wrap::dynamic(vec![Vec::new(); 2]);
+        let out = resampler.process(&waves, &bittle::none()).unwrap();
         assert_eq!(out.len(), 2);
         assert!(out[0].is_empty());
         assert!(out[1].is_empty());
@@ -685,8 +760,8 @@ mod tests {
         let mut resampler = FftFixedIn::<f64>::new(44100, 48000, 1024, 2, 2);
         let frames = resampler.nbr_frames_needed();
         assert_eq!(frames, 1024);
-        let waves = vec![vec![0.0f64; frames]; 2];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::dynamic![[0.0f64; frames]; 2];
+        let out = resampler.process(&waves, &bittle::all()).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 640);
     }
@@ -696,8 +771,8 @@ mod tests {
         let mut resampler = FftFixedIn::<f64>::new(48000, 16000, 1200, 2, 2);
         let frames = resampler.nbr_frames_needed();
         assert_eq!(frames, 1200);
-        let waves = vec![vec![0.0f64; frames]; 2];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::dynamic![[0.0f64; frames]; 2];
+        let out = resampler.process(&waves, &bittle::all()).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 400);
     }
@@ -707,8 +782,9 @@ mod tests {
         let mut resampler = FftFixedIn::<f64>::new(44100, 48000, 1024, 2, 2);
         let frames = resampler.nbr_frames_needed();
         assert_eq!(frames, 1024);
-        let waves = vec![vec![0.0f64; frames], Vec::new()];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::wrap::dynamic(vec![vec![0.0f64; frames], Vec::new()]);
+        let mask: bittle::FixedSet<u128> = bittle::fixed_set![0];
+        let out = resampler.process(&waves, &mask).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 640);
         assert!(out[1].is_empty());
@@ -719,8 +795,8 @@ mod tests {
         let mut resampler = FftFixedIn::<f64>::new(44100, 48000, 1024, 2, 2);
         let frames = resampler.nbr_frames_needed();
         assert_eq!(frames, 1024);
-        let waves = vec![Vec::new(); 2];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::wrap::dynamic(vec![Vec::new(); 2]);
+        let out = resampler.process(&waves, &bittle::none()).unwrap();
         assert_eq!(out.len(), 2);
         assert!(out[0].is_empty());
         assert!(out[1].is_empty());
@@ -731,8 +807,8 @@ mod tests {
         // asking for 1024 give the nearest which is 1029 -> 1120
         let mut resampler = FftFixedInOut::<f64>::new(44100, 44110, 1024, 2);
         let frames = resampler.nbr_frames_needed();
-        let waves = vec![vec![0.0f64; frames]; 2];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::dynamic![[0.0f64; frames]; 2];
+        let out = resampler.process(&waves, &bittle::all()).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 4411);
     }
@@ -742,8 +818,8 @@ mod tests {
         let mut resampler = FftFixedOut::<f64>::new(44100, 44110, 1024, 2, 2);
         let frames = resampler.nbr_frames_needed();
         assert_eq!(frames, 4410);
-        let waves = vec![vec![0.0f64; frames]; 2];
-        let out = resampler.process(&waves).unwrap();
+        let waves = audio::dynamic![[0.0f64; frames]; 2];
+        let out = resampler.process(&waves, &bittle::all()).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].len(), 1024);
     }

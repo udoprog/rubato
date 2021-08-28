@@ -12,7 +12,7 @@ static FEATURES: &[CpuFeature] = &[CpuFeature::Sse3];
 
 /// Trait governing what can be done with an SseSample.
 pub trait SseSample: Sized {
-    type Sinc;
+    type Sinc: Send + Sync;
 
     /// Pack sincs into a vector.
     /// 

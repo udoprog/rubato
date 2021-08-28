@@ -7,7 +7,7 @@ use crate::{AvxSample, NeonSample, SseSample};
 /// * [f64]
 pub trait Sample
 where
-    Self: Copy
+    Self: audio_core::Sample
         + CoerceFrom<usize>
         + CoerceFrom<f64>
         + CoerceFrom<f32>
